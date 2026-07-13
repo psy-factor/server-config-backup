@@ -1,0 +1,12 @@
+# Локальные архивы бэкапов — не коммитим (содержат секреты)
+Backups/
+*.tar.gz
+*.tar.gz.gpg
+*.tgz
+*.tgz.gpg
+
+# Каталоги отката, создаваемые restore
+server-restore-pre-*/
+
+# Прочее
+.DS_Store
