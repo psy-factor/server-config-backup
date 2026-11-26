@@ -1,11 +1,14 @@
 # Server Config Backup & Restore
 
-**Версия 1.4** · [English](#english)
+**Версия 1.4.1** · [English](#english)
 
 Два Bash-скрипта для резервного копирования конфигурации и данных Linux-сервера
 и переноса служб на чистую систему. Поддерживаются Docker Compose, Remnawave
 Panel и Node, Bedolaga Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr,
 nginx, Let's Encrypt, acme.sh и UFW.
+
+В 1.4.1 убрана автоматическая очистка. Уже созданные архивы хранятся
+без ограничения по возрасту. Устаревший параметр `--retention` игнорируется.
 
 ## Что нового в 1.4
 
@@ -59,7 +62,6 @@ sudo bash ./server-backup.sh --cold-docker -o /mnt/backup
 |------|----------|
 | `--volumes` | Включить все Docker-тома. По умолчанию снимаются тома найденных Bedolaga Bot и Cloudflare Tunnel |
 | `--no-volumes` | Пропустить все Docker-тома |
-| `--retention 0` | Отключить автоудаление. По умолчанию скрипт удаляет архивы этого IP старше 14 дней в каталоге назначения |
 
 ## Восстановление на чистом сервере
 
@@ -89,11 +91,14 @@ Restore сохраняет копии заменяемых файлов в `/roo
 
 ## English
 
-**Version 1.4** provides Bash scripts to back up Linux server configuration
+**Version 1.4.1** provides Bash scripts to back up Linux server configuration
 and application data and restore selected services on a fresh system.
 Supported services include Docker Compose, Remnawave Panel and Node, Bedolaga
 Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr, nginx, Let's
 Encrypt, acme.sh and UFW.
+
+Version 1.4.1 removes automatic cleanup. Existing archives are kept
+regardless of age. The legacy `--retention` option is ignored.
 
 ### What's new
 
@@ -138,8 +143,7 @@ containers. Use a cold run for a consistent file-level PostgreSQL copy.
 
 `--volumes` adds all Docker volumes. The default includes the volumes attached
 to detected Bedolaga Bot and Cloudflare Tunnel containers. `--no-volumes`
-skips all volumes. By default the script deletes archives for the current IP
-older than 14 days in the destination. Use `--retention 0` to disable cleanup.
+skips all volumes.
 
 The second command previews the plan. The third applies it and offers the
 component checklist in an interactive terminal. To select components on the

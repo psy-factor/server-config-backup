@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.4
+# Версия: 1.4.1
 #
 # server-restore.sh — развёртывание сервера из бэкапа, созданного server-backup.sh.
 #                     ВЕРСИЯ ДЛЯ ЧИСТОГО СЕРВЕРА (свежая ОС).
@@ -40,7 +40,7 @@
 #   projects, mtproto, docker-compose, cloudflared, volumes, postgres, systemd, crontab, firewall
 #
 set -euo pipefail
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.4.1"
 if [[ "${1:-}" == --version ]]; then
   printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
   exit 0

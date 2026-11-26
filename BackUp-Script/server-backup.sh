@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.4
+# Версия: 1.4.1
 #
 # server-backup.sh — резервная копия конфигурации сервера для быстрого развёртывания.
 #
@@ -26,7 +26,7 @@
 #   sudo ./server-backup.sh --cold-docker   # остановить контейнеры на время копирования
 #
 set -euo pipefail
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.4.1"
 if [[ "${1:-}" == --version ]]; then
   printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
   exit 0
@@ -36,7 +36,6 @@ fi
 # По умолчанию архивы кладём в подпапку Backups РЯДОМ со скриптом (можно переопределить -o).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
 DEST_DIR="$SCRIPT_DIR/Backups"      # куда складывать архивы
-RETENTION_DAYS=14                    # сколько дней хранить старые архивы (0 = не чистить)
 ENCRYPT=0                            # 1 = шифровать GPG (нужен BACKUP_PASSPHRASE)
 DUMP_VOLUMES=targets                 # targets, all или none
 COLD_DOCKER=0
@@ -125,7 +124,7 @@ while [[ $# -gt 0 ]]; do
     --volumes)     DUMP_VOLUMES=all; shift ;;
     --no-volumes)  DUMP_VOLUMES=none; shift ;;
     --cold-docker) COLD_DOCKER=1; shift ;;
-    --retention)   RETENTION_DAYS="$2"; shift 2 ;;
+    --retention)   echo "Параметр --retention игнорируется. Старые архивы сохраняются." >&2; shift 2 ;;
     -h|--help)     usage ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 1 ;;
   esac
@@ -560,13 +559,6 @@ if [[ $ENCRYPT -eq 1 ]]; then
     ARCHIVE="${ARCHIVE}.gpg"
     chmod 600 "$ARCHIVE"
   fi
-fi
-
-# ───────────────────────── Очистка старых архивов ───────────────────────────
-if [[ "$RETENTION_DAYS" -gt 0 ]]; then
-  find "$DEST_DIR" -maxdepth 1 -name "${IP_TAG}-*.tar.gz*" -type f \
-       -mtime +"$RETENTION_DAYS" -print -delete 2>/dev/null \
-       | sed 's/^/[-] удалён старый: /' || true
 fi
 
 SIZE="$(du -h "$ARCHIVE" | cut -f1)"
