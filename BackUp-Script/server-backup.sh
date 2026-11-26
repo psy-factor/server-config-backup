@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.4.1
+# Версия: 1.4.2
 #
 # server-backup.sh — резервная копия конфигурации сервера для быстрого развёртывания.
 #
@@ -26,7 +26,7 @@
 #   sudo ./server-backup.sh --cold-docker   # остановить контейнеры на время копирования
 #
 set -euo pipefail
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 if [[ "${1:-}" == --version ]]; then
   printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
   exit 0
@@ -474,7 +474,11 @@ done
 
 # ───────────────────────────── 4. nginx ─────────────────────────────────────
 log "nginx"
-copy /etc/nginx              "system"
+if [[ -d /etc/nginx ]]; then
+  mkdir -p "$STAGE/system/etc/nginx"
+  cp -a /etc/nginx/. "$STAGE/system/etc/nginx/"
+  ok "сохранено: /etc/nginx"
+fi
 dump_cmd system/nginx-T.txt  nginx -T
 
 # ──────────────────────── 5. TLS / Let's Encrypt ────────────────────────────

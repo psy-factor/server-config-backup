@@ -1,11 +1,16 @@
 # Server Config Backup & Restore
 
-**Версия 1.4.1** · [English](#english)
+**Версия 1.4.2** · [English](#english)
 
 Два Bash-скрипта для резервного копирования конфигурации и данных Linux-сервера
 и переноса служб на чистую систему. Поддерживаются Docker Compose, Remnawave
 Panel и Node, Bedolaga Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr,
 nginx, Let's Encrypt, acme.sh и UFW.
+
+В 1.4.2 nginx проверяется после восстановления сертификатов и запуска
+приложений. Если `nginx -t` завершается ошибкой, скрипт показывает её и
+возвращает ненулевой код. Для отдельного переноса nginx с сертификатами
+укажите `--only letsencrypt,nginx`.
 
 В 1.4.1 убрана автоматическая очистка. Уже созданные архивы хранятся
 без ограничения по возрасту. Устаревший параметр `--retention` игнорируется.
@@ -91,11 +96,15 @@ Restore сохраняет копии заменяемых файлов в `/roo
 
 ## English
 
-**Version 1.4.1** provides Bash scripts to back up Linux server configuration
+**Version 1.4.2** provides Bash scripts to back up Linux server configuration
 and application data and restore selected services on a fresh system.
 Supported services include Docker Compose, Remnawave Panel and Node, Bedolaga
 Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr, nginx, Let's
 Encrypt, acme.sh and UFW.
+
+Version 1.4.2 validates nginx after restoring certificates and starting the
+applications. A failed `nginx -t` is reported with a nonzero exit status.
+Use `--only letsencrypt,nginx` to restore nginx and certificates separately.
 
 Version 1.4.1 removes automatic cleanup. Existing archives are kept
 regardless of age. The legacy `--retention` option is ignored.

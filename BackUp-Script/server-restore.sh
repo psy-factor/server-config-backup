@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.4.1
+# Версия: 1.4.2
 #
 # server-restore.sh — развёртывание сервера из бэкапа, созданного server-backup.sh.
 #                     ВЕРСИЯ ДЛЯ ЧИСТОГО СЕРВЕРА (свежая ОС).
@@ -40,7 +40,7 @@
 #   projects, mtproto, docker-compose, cloudflared, volumes, postgres, systemd, crontab, firewall
 #
 set -euo pipefail
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 if [[ "${1:-}" == --version ]]; then
   printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
   exit 0
@@ -527,13 +527,6 @@ if [[ -n "${HAS[sysctl]:-}" ]] && should_do sysctl "ядро / сеть"; then
   run_sh "sysctl --system >/dev/null 2>&1 || true"
 fi
 
-# nginx
-if [[ -n "${HAS[nginx]:-}" ]] && should_do nginx "веб-сервер nginx"; then
-  restore_path system /etc/nginx
-  # перезапуск только если конфиг валиден
-  run_sh "nginx -t >/dev/null 2>&1 && { systemctl enable nginx >/dev/null 2>&1 || true; systemctl restart nginx; } || echo '[!] nginx -t показал ошибки — НЕ перезапускаю, проверь конфиг.'"
-fi
-
 # Let's Encrypt + серты в /root/cert
 if [[ -n "${HAS[letsencrypt]:-}" ]] && should_do letsencrypt "TLS-сертификаты"; then
   restore_path system /etc/letsencrypt
@@ -684,6 +677,7 @@ fi
 step "Фаза 3 — запуск проектов"
 
 # Тома нужно наполнить до запуска Compose и cloudflared.
+declare -A restored_volumes=()
 if [[ -n "${HAS[volumes]:-}" ]] && should_do volumes "данные Docker volumes"; then
   while IFS= read -r vd; do
     vname="$(basename "$vd" .tar.gz)"
@@ -695,6 +689,7 @@ if [[ -n "${HAS[volumes]:-}" ]] && should_do volumes "данные Docker volume
     run docker run --rm --mount "type=volume,src=$vname,dst=/to" \
       --mount "type=bind,src=$(dirname "$vd"),dst=/from,readonly" \
       alpine tar xzf "/from/$(basename "$vd")" -C /to
+    restored_volumes[$vname]=1
     ok "volume восстановлен: $vname"
   done < <(find "$STAGEROOT/docker/volumes-data" -maxdepth 1 -type f -name '*.tar.gz' 2>/dev/null | sort)
 fi
@@ -890,11 +885,19 @@ fi
 
 # 3.1c восстановление баз PostgreSQL из дампов
 if [[ -n "${HAS[postgres]:-}" ]] && should_do postgres "восстановление баз PostgreSQL"; then
+  sql_import_attempted=0
   for dump in "$STAGEROOT/docker/pg-dumps/"*.sql.gz; do
     [[ -e "$dump" ]] || continue
     c="$(basename "$dump" .sql.gz)"
     if [[ -f "$STAGEROOT/docker/pg-data-volumes/$c" && "$ONLY" != postgres ]]; then
-      log "$c: сохранён том PostgreSQL. Для отдельного импорта SQL используй --only postgres."
+      pg_volume="$(<"$STAGEROOT/docker/pg-data-volumes/$c")"
+      if [[ $APPLY -eq 0 ]]; then
+        log "$c: в плане используется том PostgreSQL $pg_volume, без SQL-импорта."
+      elif [[ -n "$pg_volume" && -n "${restored_volumes[$pg_volume]:-}" ]]; then
+        log "$c: восстановлен том PostgreSQL $pg_volume, SQL-импорт пропущен."
+      else
+        warn "$c: том PostgreSQL $pg_volume не восстанавливался в этом запуске. SQL-импорт пропущен."
+      fi
       continue
     fi
     log "БД контейнера: $c"
@@ -910,8 +913,11 @@ if [[ -n "${HAS[postgres]:-}" ]] && should_do postgres "восстановлен
       [[ $rdy -eq 1 ]] || { warn "postgres в $c не готов — пропускаю."; continue; }
     fi
     run_sh "gunzip -c '$dump' | docker exec -i '$c' sh -c 'psql -v ON_ERROR_STOP=0 -U \"\${POSTGRES_USER:-postgres}\" -d postgres' >/dev/null 2>&1 && echo '[+] БД восстановлена в $c' || echo '[!] ошибки при восстановлении БД в $c'"
+    sql_import_attempted=1
   done
-  warn "После восстановления БД перезапусти зависимые сервисы: docker compose restart в каталоге проекта."
+  if [[ $sql_import_attempted -eq 1 ]]; then
+    warn "После импорта SQL перезапусти зависимые сервисы: docker compose restart в каталоге проекта."
+  fi
 fi
 
 # 3.2 нативные службы (если unit восстановлен в /etc/systemd/system)
@@ -974,6 +980,17 @@ if [[ -n "${HAS[firewall]:-}" ]] && should_do firewall "firewall (ufw)"; then
     run cp -a "$STAGEROOT/system/iptables.txt" /root/iptables-backup.rules
     warn "Сырые правила iptables сохранены в /root/iptables-backup.rules (НЕ применяю автоматически: конфликт с Docker)."
     echo "      Применить вручную при необходимости: iptables-restore < /root/iptables-backup.rules"
+  fi
+fi
+
+# nginx применяет конфиги после возврата TLS, файлов сайтов и запуска upstream.
+if [[ -n "${HAS[nginx]:-}" ]] && should_do nginx "веб-сервер nginx"; then
+  restore_path system /etc/nginx
+  run nginx -t || die "Nginx не применил конфигурацию. Причина указана выше в выводе nginx -t."
+  run systemctl enable nginx || warn "Не удалось включить автозапуск nginx."
+  run systemctl reload-or-restart nginx || die "Не удалось загрузить восстановленную конфигурацию nginx."
+  if [[ $APPLY -eq 1 ]]; then
+    ok "конфигурация nginx применена"
   fi
 fi
 
