@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.3
+# Версия: 1.4
 #
 # server-restore.sh — развёртывание сервера из бэкапа, созданного server-backup.sh.
 #                     ВЕРСИЯ ДЛЯ ЧИСТОГО СЕРВЕРА (свежая ОС).
@@ -37,9 +37,14 @@
 #
 # Компоненты для --only:
 #   prereqs, sysctl, nginx, letsencrypt, ssh, ssh-keys, 3x-ui, remnawave,
-#   projects, mtproto, docker-compose, volumes, postgres, systemd, crontab, firewall
+#   projects, mtproto, docker-compose, cloudflared, volumes, postgres, systemd, crontab, firewall
 #
 set -euo pipefail
+SCRIPT_VERSION="1.4"
+if [[ "${1:-}" == --version ]]; then
+  printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
+  exit 0
+fi
 
 # ─────────────────────────────── Аргументы ──────────────────────────────────
 ARCHIVE=""
@@ -256,6 +261,7 @@ PRE_RESTORE_DIR="/root/server-restore-pre-$(date +%Y%m%d-%H%M%S)"
 # ─────────────────────── Определяем, что есть в бэкапе ───────────────────────
 declare -A HAS
 [[ -d "$STAGEROOT/docker/compose" ]]            && HAS[docker-compose]=1
+[[ -d "$STAGEROOT/docker/cloudflared" ]]        && HAS[cloudflared]=1
 [[ -d "$STAGEROOT/3x-ui" ]]                     && HAS[3x-ui]=1
 [[ -d "$STAGEROOT/remnawave" ]]                 && HAS[remnawave]=1
 [[ -d "$STAGEROOT/projects" ]]                  && HAS[projects]=1
@@ -276,7 +282,7 @@ step "Содержимое бэкапа"
 [[ -f "$STAGEROOT/MANIFEST.txt" ]] && sed -n '1,12p' "$STAGEROOT/MANIFEST.txt"
 echo "Обнаруженные компоненты:"
 for k in prereqs sysctl nginx letsencrypt ssh ssh-keys 3x-ui remnawave projects \
-         mtproto docker-compose postgres volumes systemd crontab firewall; do
+         mtproto docker-compose cloudflared postgres volumes systemd crontab firewall; do
   [[ -n "${HAS[$k]:-}" ]] && printf '   \033[1;32m✓\033[0m %s\n' "$k"
 done
 echo
@@ -311,6 +317,7 @@ select_components() {
   add projects       "${HAS[projects]:-}${HAS[remnawave]:-}" "Проекты — remnawave (panel/node), cabinet, photo"
   add mtproto        "${HAS[mtproto]:-}"                     "MTProto — telemt / mtproto.zig / mekopr (+права)"
   add docker-compose "${HAS[docker-compose]:-}"              "Docker Compose — проекты и контейнеры"
+  add cloudflared    "${HAS[cloudflared]:-}"                 "Cloudflare Tunnel — отдельный Docker-контейнер"
   add postgres       "${HAS[postgres]:-}"                    "PostgreSQL — восстановление баз из дампов"
   add volumes        "${HAS[volumes]:-}"                     "Docker volumes — данные (перезапись!)"
   add systemd        "${HAS[systemd]:-}"                     "systemd — кастомные службы (unit-файлы, запуск)"
@@ -433,7 +440,11 @@ step "Фаза 1 — необходимые пакеты"
 #   curl/wget  — докачка установщиков (docker/3x-ui/telemt) и их зависимостей;
 #   tar/gzip   — распаковка. Ставим ВСЕГДА и без лишних вопросов.
 BASE_MISSING=()
-for c in rsync curl wget tar gzip; do
+base_tools=(rsync curl wget tar gzip)
+if [[ -d "$STAGEROOT/docker/compose-targets" || -n "${HAS[cloudflared]:-}" ]]; then
+  base_tools+=(python3)
+fi
+for c in "${base_tools[@]}"; do
   command -v "$c" >/dev/null 2>&1 || BASE_MISSING+=("$c")
 done
 if [[ ${#BASE_MISSING[@]} -gt 0 ]]; then
@@ -444,11 +455,11 @@ if [[ ${#BASE_MISSING[@]} -gt 0 ]]; then
     warn "Не хватает утилит: ${BASE_MISSING[*]} — восстановление может частично не сработать (доустановка отключена)."
   fi
 else
-  ok "базовые утилиты на месте (rsync/curl/wget/tar/gzip)"
+  ok "базовые утилиты на месте"
 fi
 
 NEED_DOCKER=0
-[[ -n "${HAS[docker-compose]:-}${HAS[remnawave]:-}${HAS[projects]:-}${HAS[postgres]:-}${HAS[volumes]:-}" ]] && NEED_DOCKER=1
+[[ -n "${HAS[docker-compose]:-}${HAS[cloudflared]:-}${HAS[remnawave]:-}${HAS[projects]:-}${HAS[postgres]:-}${HAS[volumes]:-}" ]] && NEED_DOCKER=1
 
 # Docker Engine
 if [[ $NEED_DOCKER -eq 1 ]] && ! command -v docker >/dev/null 2>&1; then
@@ -672,38 +683,209 @@ fi
 # ════════════════════ ФАЗА 3: ЗАПУСК ПРОЕКТОВ ПО ОЧЕРЕДИ ════════════════════
 step "Фаза 3 — запуск проектов"
 
-# 3.1 docker-compose проекты
-if [[ -n "${HAS[docker-compose]:-}" ]] && should_do docker-compose "docker-compose проекты"; then
-  if [[ $APPLY -eq 0 ]] || { command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; }; then
-    while IFS= read -r cf; do
-      proj_src="$(dirname "$cf")"
-      real_dir="${proj_src#"$STAGEROOT"/docker/compose}"
-      log "Проект: $real_dir"
-      backup_existing "$real_dir"
-      run mkdir -p "$real_dir"
-      if command -v rsync >/dev/null 2>&1; then
-        run rsync -a "$proj_src/" "$real_dir/"
-      else
-        run cp -a "$proj_src/." "$real_dir/"   # fallback, если rsync недоступен
-      fi
-      run_sh "cd '$real_dir' && docker compose up -d || echo '[!] не удалось поднять $real_dir (проверь .env/порты)'"
-    done < <(find "$STAGEROOT/docker/compose" \
-                \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \
-                   -o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null | sort)
-  else
-    warn "docker compose недоступен — compose-проекты пропущены."
-  fi
-fi
-
-# 3.1b именованные docker volume'ы (только если в бэкапе есть дампы; перезаписывает данные!)
-if [[ -n "${HAS[volumes]:-}" ]] && should_do volumes "данные docker volume (перезапись!)"; then
+# Тома нужно наполнить до запуска Compose и cloudflared.
+if [[ -n "${HAS[volumes]:-}" ]] && should_do volumes "данные Docker volumes"; then
   while IFS= read -r vd; do
     vname="$(basename "$vd" .tar.gz)"
     confirm "Перезаписать данные volume '$vname'?" || continue
+    if [[ $APPLY -eq 1 && -n "$(docker ps -q --filter "volume=$vname")" ]]; then
+      die "Том $vname используется работающим контейнером. Останови его до восстановления."
+    fi
     run docker volume create "$vname"
-    run_sh "docker run --rm -v '$vname':/to -v '$(dirname "$vd")':/from alpine sh -c 'cd /to && tar xzf /from/$(basename "$vd")'"
+    run docker run --rm --mount "type=volume,src=$vname,dst=/to" \
+      --mount "type=bind,src=$(dirname "$vd"),dst=/from,readonly" \
+      alpine tar xzf "/from/$(basename "$vd")" -C /to
     ok "volume восстановлен: $vname"
   done < <(find "$STAGEROOT/docker/volumes-data" -maxdepth 1 -type f -name '*.tar.gz' 2>/dev/null | sort)
+fi
+
+# 3.1 docker-compose проекты
+restore_compose_dir() {
+  local project_dir="$1"; shift
+  log "Проект: $project_dir"
+  backup_existing "$project_dir"
+  run mkdir -p "$project_dir"
+  local source="$STAGEROOT/docker/compose$project_dir"
+  if command -v rsync >/dev/null 2>&1; then
+    run rsync -a "$source/" "$project_dir/"
+  else
+    run cp -a "$source/." "$project_dir/"
+  fi
+  if ! run bash -c 'cd "$1" || exit; shift; exec docker compose "$@" up -d' bash "$project_dir" "$@"; then
+    warn "Не удалось запустить Compose-проект: $project_dir"
+  fi
+}
+
+restore_docker_bind() {
+  case "$1" in
+    /etc/localtime|/etc/timezone|/etc/fstab|/etc/hosts|/etc/hostname|/etc/resolv.conf) return 0 ;;
+  esac
+  restore_path docker/files "$1"
+}
+
+if [[ -n "${HAS[docker-compose]:-}" ]] && should_do docker-compose "docker-compose проекты"; then
+  if [[ $APPLY -eq 0 ]] || { command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; }; then
+    declare -A targeted_compose_dirs=() targeted_compose_files=()
+    for plan in "$STAGEROOT/docker/compose-targets/"*.json; do
+      [[ -f "$plan" ]] || continue
+      mapfile -d '' -t paths < <(python3 -c '
+import json, os, sys
+p = json.load(open(sys.argv[1]))
+for path in [p["directory"], *p["files"]]:
+    sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+' "$plan")
+      targeted_compose_dirs[${paths[0]}]=1
+      for path in "${paths[@]:1}"; do targeted_compose_files[$path]=1; done
+    done
+    while IFS= read -r cf; do
+      proj_src="$(dirname "$cf")"
+      real_dir="${proj_src#"$STAGEROOT"/docker/compose}"
+      [[ -z "${targeted_compose_dirs[$real_dir]:-}${targeted_compose_files[${cf#"$STAGEROOT"/docker/compose}]:-}" ]] || continue
+      restore_compose_dir "$real_dir"
+    done < <(find "$STAGEROOT/docker/compose" \
+                \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \
+                   -o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null | sort)
+
+    for plan in "$STAGEROOT/docker/compose-targets/"*.json; do
+      [[ -f "$plan" ]] || continue
+      mapfile -d '' -t fields < <(python3 -c '
+import json, os, sys
+p = json.load(open(sys.argv[1]))
+fields = [p["directory"], p["project"], ",".join(p["components"])]
+for flag, key in (("-f", "files"), ("--env-file", "env_files"), ("bind", "binds")):
+    for path in p[key]:
+        fields.extend((flag, os.path.abspath(os.path.join(p["directory"], path))))
+for field in fields:
+    sys.stdout.buffer.write(os.fsencode(field) + b"\0")
+' "$plan")
+      d="${fields[0]}"
+      compose_args=(--project-name "${fields[1]}" --project-directory "$d")
+      for ((i=3; i<${#fields[@]}; i+=2)); do
+        option="${fields[i]}"
+        path="${fields[i+1]}"
+        if [[ "$option" == bind ]]; then
+          [[ "$path" == "$d/"* ]] || restore_docker_bind "$path"
+        else
+          [[ "$path" == "$d/"* ]] || restore_path docker/files "$path"
+          compose_args+=("$option" "$path")
+        fi
+      done
+      log "Восстановление ${fields[2]} (Compose-проект ${fields[1]})"
+      restore_compose_dir "$d" "${compose_args[@]}"
+    done
+  else
+    warn "docker compose недоступен - compose-проекты пропущены."
+  fi
+fi
+
+# Отдельный cloudflared, запущенный через docker run.
+if [[ -n "${HAS[cloudflared]:-}" ]] && should_do cloudflared "Cloudflare Tunnel (отдельный контейнер)"; then
+  if [[ $APPLY -eq 0 ]] || command -v docker >/dev/null 2>&1; then
+    for plan in "$STAGEROOT/docker/cloudflared/"*.json; do
+      [[ -f "$plan" ]] || continue
+      name="${plan##*/}"
+      log "Cloudflare Tunnel: ${name%.json}"
+      if [[ $APPLY -eq 1 ]] && docker inspect --type container "${name%.json}" >/dev/null 2>&1; then
+        warn "Контейнер ${name%.json} уже существует, пропускаю."
+        continue
+      fi
+      while IFS= read -r -d '' path; do
+        restore_docker_bind "$path"
+      done < <(python3 -c '
+import json, os, sys
+for mount in json.load(open(sys.argv[1])).get("Mounts") or []:
+    if mount["Type"] == "bind":
+        sys.stdout.buffer.write(os.fsencode(mount["Source"]) + b"\0")
+' "$plan")
+      [[ $APPLY -eq 1 ]] || continue
+      # Команда и окружение могут содержать токен: передаём их Docker без печати.
+      python3 - "$plan" <<'RESTORE_CLOUDFLARED'
+import csv
+import io
+import json
+import subprocess
+import sys
+
+c = json.load(open(sys.argv[1]))
+name = c['Name'].lstrip('/')
+config = c['Config']
+host = c.get('HostConfig') or {}
+networks = (c.get('NetworkSettings') or {}).get('Networks') or {}
+mode = host.get('NetworkMode') or ''
+primary = mode
+if mode in ('default', '') or networks and mode not in networks and not mode.startswith('container:'):
+    primary = next(iter(networks), 'bridge')
+cmd = ['docker', 'create', '--name', name, '--network', primary]
+restart = host.get('RestartPolicy') or {}
+if restart.get('Name') not in (None, '', 'no'):
+    policy = restart['Name']
+    if policy == 'on-failure' and restart.get('MaximumRetryCount'):
+        policy += f':{restart["MaximumRetryCount"]}'
+    cmd.extend(('--restart', policy))
+for flag, value in (('--user', config.get('User')), ('--workdir', config.get('WorkingDir'))):
+    if value:
+        cmd.extend((flag, value))
+for flag, values in (('--env', config.get('Env')), ('--dns', host.get('Dns')),
+                     ('--dns-search', host.get('DnsSearch')), ('--add-host', host.get('ExtraHosts'))):
+    for value in values or []:
+        cmd.extend((flag, value))
+if host.get('ReadonlyRootfs'):
+    cmd.append('--read-only')
+for port, bindings in (host.get('PortBindings') or {}).items():
+    for binding in bindings or []:
+        address = binding.get('HostIp') or ''
+        if ':' in address:
+            address = f'[{address}]'
+        cmd.extend(('--publish', (address + ':' if address else '') + binding['HostPort'] + ':' + port))
+for mount in c.get('Mounts') or []:
+    kind = mount['Type']
+    if kind not in ('bind', 'volume'):
+        continue
+    source = mount['Name'] if kind == 'volume' else mount['Source']
+    fields = [f'type={kind}', f'source={source}', f'target={mount["Destination"]}']
+    if not mount['RW']:
+        fields.append('readonly')
+    if kind == 'bind' and mount.get('Propagation'):
+        fields.append(f'bind-propagation={mount["Propagation"]}')
+    formatted = io.StringIO()
+    csv.writer(formatted, lineterminator='').writerow(fields)
+    cmd.extend(('--mount', formatted.getvalue()))
+
+def aliases(network):
+    if network in ('bridge', 'host', 'none'):
+        return []
+    return [alias for alias in networks.get(network, {}).get('Aliases') or [] if alias != name]
+
+for alias in aliases(primary):
+    cmd.extend(('--network-alias', alias))
+entrypoint = config.get('Entrypoint') or []
+if entrypoint:
+    cmd.extend(('--entrypoint', entrypoint[0]))
+cmd.extend([config['Image'], *entrypoint[1:], *(config.get('Cmd') or [])])
+
+def docker_ok(command):
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+if not docker_ok(cmd):
+    raise SystemExit(f'Не удалось создать {name}. Проверь образ, сеть и пути подключений Docker.')
+for network in networks:
+    if network == primary:
+        continue
+    connect = ['docker', 'network', 'connect']
+    for alias in aliases(network):
+        connect.extend(('--alias', alias))
+    if not docker_ok([*connect, network, name]):
+        docker_ok(['docker', 'rm', '-f', name])
+        raise SystemExit(f'Не удалось подключить {name} к сети {network}.')
+if (c.get('State') or {}).get('Running') and not docker_ok(['docker', 'start', name]):
+    docker_ok(['docker', 'rm', '-f', name])
+    raise SystemExit(f'Не удалось запустить {name}.')
+RESTORE_CLOUDFLARED
+      ok "Контейнер Cloudflare Tunnel восстановлен: ${name%.json}"
+    done
+  else
+    warn "Docker недоступен - отдельные контейнеры Cloudflare Tunnel пропущены."
+  fi
 fi
 
 # 3.1c восстановление баз PostgreSQL из дампов
@@ -711,6 +893,10 @@ if [[ -n "${HAS[postgres]:-}" ]] && should_do postgres "восстановлен
   for dump in "$STAGEROOT/docker/pg-dumps/"*.sql.gz; do
     [[ -e "$dump" ]] || continue
     c="$(basename "$dump" .sql.gz)"
+    if [[ -f "$STAGEROOT/docker/pg-data-volumes/$c" && "$ONLY" != postgres ]]; then
+      log "$c: сохранён том PostgreSQL. Для отдельного импорта SQL используй --only postgres."
+      continue
+    fi
     log "БД контейнера: $c"
     if [[ $APPLY -eq 1 ]]; then
       if ! docker inspect "$c" >/dev/null 2>&1; then

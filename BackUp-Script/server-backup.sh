@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# Версия: 1.3
+# Версия: 1.4
 #
 # server-backup.sh — резервная копия конфигурации сервера для быстрого развёртывания.
 #
 # Что собирает:
-#   - Docker: docker-compose проекты, .env, список образов/контейнеров/сетей/volume,
-#             (опционально) дамп именованных volume'ов
+#   - Docker: Compose-проекты, .env, список образов, контейнеров, сетей и томов
+#   - Bedolaga Bot и Cloudflare Tunnel: конфиги, bind mounts и тома Docker
 #   - 3x-ui (VLESS): база x-ui.db + сертификаты (native или docker-вариант)
 #   - Remnawave node: docker-compose.yml + .env + сертификаты
 #   - nginx: /etc/nginx целиком
@@ -18,12 +18,19 @@
 # Результат: один tar.gz (опционально зашифрованный GPG) + manifest с метаданными.
 #
 # Использование:
-#   sudo ./server-backup.sh                 # обычный бэкап в /var/backups/server
+#   sudo ./server-backup.sh                 # бэкап в Backups рядом со скриптом
 #   sudo ./server-backup.sh -o /mnt/backup  # другой каталог назначения
 #   sudo BACKUP_PASSPHRASE='секрет' ./server-backup.sh -e   # с шифрованием
-#   sudo ./server-backup.sh --volumes       # + дамп docker volume'ов (тяжело!)
+#   sudo ./server-backup.sh --volumes       # включить все тома Docker
+#   sudo ./server-backup.sh --no-volumes    # исключить тома Docker
+#   sudo ./server-backup.sh --cold-docker   # остановить контейнеры на время копирования
 #
 set -euo pipefail
+SCRIPT_VERSION="1.4"
+if [[ "${1:-}" == --version ]]; then
+  printf '%s %s\n' "${0##*/}" "$SCRIPT_VERSION"
+  exit 0
+fi
 
 # ─────────────────────────────── Настройки ──────────────────────────────────
 # По умолчанию архивы кладём в подпапку Backups РЯДОМ со скриптом (можно переопределить -o).
@@ -31,7 +38,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
 DEST_DIR="$SCRIPT_DIR/Backups"      # куда складывать архивы
 RETENTION_DAYS=14                    # сколько дней хранить старые архивы (0 = не чистить)
 ENCRYPT=0                            # 1 = шифровать GPG (нужен BACKUP_PASSPHRASE)
-DUMP_VOLUMES=0                       # 1 = дампить именованные docker volume'ы
+DUMP_VOLUMES=targets                 # targets, all или none
+COLD_DOCKER=0
+STOPPED_CONTAINERS=()
 HOSTNAME_TAG="$(hostname -s 2>/dev/null || echo server)"
 
 # Каталоги, где обычно лежат docker-compose проекты (3x-ui, remnanode и пр.).
@@ -102,7 +111,7 @@ EXTRA_PROJECT_PATHS=(
 
 # Имена docker-контейнеров с PostgreSQL, которые нужно дампить через pg_dump.
 # Скрипт также автоматически найдёт контейнеры с образом postgres/postgis.
-PG_CONTAINERS_EXTRA=(remnawave-db)
+PG_CONTAINERS_EXTRA=(remnawave-db remnawave_bot_db)
 
 # ─────────────────────────── Разбор аргументов ──────────────────────────────
 usage() {
@@ -113,7 +122,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -o|--out)      DEST_DIR="$2"; shift 2 ;;
     -e|--encrypt)  ENCRYPT=1; shift ;;
-    --volumes)     DUMP_VOLUMES=1; shift ;;
+    --volumes)     DUMP_VOLUMES=all; shift ;;
+    --no-volumes)  DUMP_VOLUMES=none; shift ;;
+    --cold-docker) COLD_DOCKER=1; shift ;;
     --retention)   RETENTION_DAYS="$2"; shift 2 ;;
     -h|--help)     usage ;;
     *) echo "Неизвестный аргумент: $1" >&2; exit 1 ;;
@@ -166,7 +177,17 @@ dump_cmd() {  # dump_cmd <file> <cmd...>
   "$@" > "$STAGE/$out" 2>/dev/null || true
 }
 
-cleanup() { rm -rf "$WORK"; }
+restart_containers() {
+  [[ ${#STOPPED_CONTAINERS[@]} -gt 0 ]] || return 0
+  docker start "${STOPPED_CONTAINERS[@]}" >/dev/null || return
+  STOPPED_CONTAINERS=()
+}
+cleanup() {
+  local status=$?
+  restart_containers || status=1
+  rm -rf "$WORK"
+  exit "$status"
+}
 trap cleanup EXIT
 
 [[ $EUID -ne 0 ]] && warn "Скрипт лучше запускать через sudo/root, иначе часть файлов будет пропущена."
@@ -189,21 +210,167 @@ if command -v docker >/dev/null 2>&1; then
     done
   fi
 
-  # Поиск compose-проектов и копирование их каталогов целиком
-  log "Поиск docker-compose проектов"
-  declare -A SEEN
-  while IFS= read -r f; do
-    d="$(dirname "$f")"
-    [[ -n "${SEEN[$d]:-}" ]] && continue
+  if [[ $COLD_DOCKER -eq 1 ]]; then
+    mapfile -t STOPPED_CONTAINERS < <(docker ps -q)
+    if [[ ${#STOPPED_CONTAINERS[@]} -gt 0 ]]; then
+      log "Остановка контейнеров для холодной копии"
+      docker stop "${STOPPED_CONTAINERS[@]}" >/dev/null
+    fi
+  fi
+
+  copy_docker_source() {
+    local source="$1"
+    mkdir -p "$STAGE/docker/files"
+    rsync -aR -- "$source" "$STAGE/docker/files/"
+  }
+
+  declare -A SEEN=()
+  backup_compose_dir() {
+    local d="$1" base="docker/compose$1"
+    [[ -z "${SEEN[$d]:-}" ]] || return 0
     SEEN[$d]=1
-    base="docker/compose${d}"
     mkdir -p "$STAGE/$base"
-    # копируем сам каталог проекта, но без потенциально огромных data-папок
-    rsync -a --exclude='*.log' "$d/" "$STAGE/$base/" 2>/dev/null \
-      || cp -a "$d/." "$STAGE/$base/" 2>/dev/null || true
+    rsync -a --exclude='/Backups/' --exclude='*.log' "$d/" "$STAGE/$base/" 2>/dev/null \
+      || cp -a "$d/." "$STAGE/$base/" || return
     ok "compose-проект: $d"
+  }
+
+  # Активные и остановленные контейнеры дают исходный каталог, имя проекта,
+  # порядок -f и --env-file, даже если проект лежит вне стандартных папок.
+  python3 - "$STAGE/docker" "$WORK" "$DUMP_VOLUMES" <<'DOCKER_TARGETS'
+import json
+import posixpath
+import re
+import sys
+from pathlib import Path
+
+docker = Path(sys.argv[1])
+work = Path(sys.argv[2])
+with_volumes = sys.argv[3] != 'none'
+containers = []
+for path in sorted((docker / 'inspect').glob('*.json')):
+    if path.stat().st_size:
+        containers.extend(json.loads(path.read_text()))
+
+prefix = 'com.docker.compose.'
+projects = {}
+tunnels = set()
+for container in containers:
+    config = container.get('Config') or {}
+    labels = config.get('Labels') or {}
+    if labels.get(prefix + 'oneoff', '').lower() == 'true':
+        continue
+    name = container['Name'].lstrip('/')
+    image = config.get('Image', '').rsplit('/', 1)[-1].split('@')[0].split(':')[0]
+    project = labels.get(prefix + 'project')
+    workdir = labels.get(prefix + 'project.working_dir', '')
+    bot_id = f'{project} {workdir} {image}'.lower()
+    bot = name in ('remnawave_bot', 'remnawave_bot_db', 'remnawave_bot_redis') or (
+        'bedolaga-cabinet' not in bot_id and
+        any(key in bot_id for key in ('remnawave-bedolaga-telegram-bot', 'bedolaga-bot'))
+    )
+    tunnel = image == 'cloudflared'
+    if not (bot or tunnel):
+        continue
+    if not project:
+        if tunnel:
+            tunnels.add(name)
+            path = docker / 'cloudflared' / f'{name}.json'
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(container, indent=2) + '\n')
+        continue
+    if not re.fullmatch('[a-z0-9][a-z0-9_-]*', project):
+        raise SystemExit('Не удалось определить имя Compose-проекта')
+    files = labels.get(prefix + 'project.config_files', '')
+    env_files = labels.get(prefix + 'project.environment_file', '')
+    if not workdir.startswith('/') or workdir == '/' or not files:
+        raise SystemExit(f'Не удалось определить файлы Compose-проекта {project}')
+    workdir = posixpath.normpath(workdir)
+    plan = projects.setdefault(project, {
+        'project': project, 'directory': workdir,
+        'files': [posixpath.normpath(posixpath.join(workdir, path)) for path in files.split(',')],
+        'env_files': [posixpath.normpath(posixpath.join(workdir, path)) for path in env_files.split(',')] if env_files else [],
+        'components': [], 'binds': [],
+    })
+    for component, enabled in (('bedolaga-bot', bot), ('cloudflared', tunnel)):
+        if enabled and component not in plan['components']:
+            plan['components'].append(component)
+
+binds = set()
+volumes = set()
+for container in containers:
+    name = container['Name'].lstrip('/')
+    config = container.get('Config') or {}
+    labels = config.get('Labels') or {}
+    plan = projects.get(labels.get(prefix + 'project'))
+    if plan is None and name not in tunnels:
+        continue
+    pgdata = next((env.partition('=')[2] for env in config.get('Env') or []
+                   if env.startswith('PGDATA=')), '/var/lib/postgresql/data')
+    for mount in container.get('Mounts') or []:
+        if mount['Type'] == 'bind':
+            source = mount['Source']
+            if source == '/' or source.startswith(('/proc/', '/sys/', '/dev/', '/run/', '/var/run/', '/var/lib/docker/')):
+                continue
+            if source in ('/proc', '/sys', '/dev', '/run', '/var/run', '/var/lib/docker') or Path(source).is_socket():
+                continue
+            if plan is not None and source not in plan['binds']:
+                plan['binds'].append(source)
+            if plan is None or not source.startswith(plan['directory'] + '/'):
+                binds.add(source)
+        elif with_volumes and mount['Type'] == 'volume':
+            volumes.add(mount['Name'])
+            destination = mount['Destination'].rstrip('/')
+            if pgdata == destination or pgdata.startswith(destination + '/'):
+                path = docker / 'pg-data-volumes' / name
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(mount['Name'] + '\n')
+
+(work / 'docker-target-volumes').write_text(''.join(v + '\n' for v in sorted(volumes)))
+with (work / 'docker-target-binds').open('wb') as paths:
+    for source in sorted(binds):
+        paths.write(source.encode() + b'\0')
+
+for project, plan in projects.items():
+    path = docker / 'compose-targets' / f'{project}.json'
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(plan, indent=2) + '\n')
+DOCKER_TARGETS
+
+  while IFS= read -r -d '' source; do
+    if [[ -e "$source" ]]; then
+      copy_docker_source "$source"
+    fi
+  done < "$WORK/docker-target-binds"
+
+  for plan in "$STAGE/docker/compose-targets/"*.json; do
+    [[ -f "$plan" ]] || continue
+    mapfile -d '' -t compose_paths < <(python3 -c '
+import json, os, sys
+plan = json.load(open(sys.argv[1]))
+for path in [plan["directory"], *plan["files"], *plan["env_files"]]:
+    sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+' "$plan")
+    d="${compose_paths[0]}"
+    if [[ ! -d "$d" ]]; then
+      warn "Каталог Compose-проекта не найден: $d"; exit 1
+    fi
+    backup_compose_dir "$d"
+    for f in "${compose_paths[@]:1}"; do
+      if [[ ! -f "$f" ]]; then
+        warn "Файл Compose-проекта недоступен для копирования: $f"; exit 1
+      fi
+      [[ "$f" == "$d/"* ]] || copy_docker_source "$f"
+    done
+    ok "Bedolaga Bot / Cloudflare Tunnel: сохранён план Compose ${plan##*/}"
+  done
+
+  log "Поиск docker-compose проектов"
+  while IFS= read -r f; do
+    backup_compose_dir "$(dirname "$f")" || warn "Ошибка проекта: $f"
   done < <(
     for sd in "${COMPOSE_SEARCH_DIRS[@]}"; do
+      log "Поиск Compose: $sd" >&2
       [[ -d "$sd" ]] && find "$sd" -maxdepth 4 \
         \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) \
         2>/dev/null
@@ -217,8 +384,9 @@ if command -v docker >/dev/null 2>&1; then
   # автопоиск по образу + явный список
   pg_found="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
               | awk '/postgres|postgis/ {print $1}')"
-  for c in $(printf '%s\n' $pg_found "${PG_CONTAINERS_EXTRA[@]}" | sort -u); do
-    docker inspect "$c" >/dev/null 2>&1 || continue
+  while IFS= read -r c; do
+    [[ $COLD_DOCKER -eq 0 && -n "$c" ]] || continue
+    [[ "$(docker inspect --format '{{.State.Running}}' "$c" 2>/dev/null)" == true ]] || continue
     # POSTGRES_USER/POSTGRES_DB заданы внутри контейнера — используем их
     if docker exec "$c" sh -c 'pg_dumpall -U "${POSTGRES_USER:-postgres}"' 2>/dev/null \
          | gzip > "$STAGE/docker/pg-dumps/${c}.sql.gz" \
@@ -228,18 +396,33 @@ if command -v docker >/dev/null 2>&1; then
       rm -f "$STAGE/docker/pg-dumps/${c}.sql.gz"
       warn "не удалось дампить БД контейнера $c"
     fi
-  done
+  done < <(printf '%s\n' "$pg_found" "${PG_CONTAINERS_EXTRA[@]}" | sort -u)
 
-  # Дамп именованных volume'ов (по запросу — может быть тяжело)
-  if [[ $DUMP_VOLUMES -eq 1 ]]; then
-    log "Дамп docker volume'ов"
-    mkdir -p "$STAGE/docker/volumes-data"
-    for v in $(docker volume ls -q); do
-      docker run --rm -v "$v":/from -v "$STAGE/docker/volumes-data":/to \
-        alpine sh -c "tar czf /to/${v}.tar.gz -C /from . " 2>/dev/null \
-        && ok "volume: $v" || warn "volume $v не выгружен"
-    done
+  # Тома бота и туннеля входят в обычный бэкап. --volumes добавляет остальные.
+  if [[ $DUMP_VOLUMES == all ]]; then
+    docker volume ls -q > "$WORK/docker-all-volumes"
+  else
+    cp "$WORK/docker-target-volumes" "$WORK/docker-all-volumes"
   fi
+  if [[ -s "$WORK/docker-all-volumes" ]]; then
+    if [[ $COLD_DOCKER -eq 0 ]]; then
+      warn "Для согласованной файловой копии БД используй --cold-docker."
+    fi
+    mkdir -p "$STAGE/docker/volumes-data"
+    while IFS= read -r v; do
+      [[ -n "$v" ]] || continue
+      archive="$STAGE/docker/volumes-data/$v.tar.gz"
+      if docker run --rm --mount "type=volume,src=$v,dst=/from,readonly" \
+          alpine tar czf - -C /from . > "$archive"; then
+        ok "volume: $v"
+      else
+        rm -f "$archive"
+        warn "volume $v не выгружен"
+        if grep -Fxq -- "$v" "$WORK/docker-target-volumes"; then exit 1; fi
+      fi
+    done < "$WORK/docker-all-volumes"
+  fi
+  restart_containers
 else
   warn "docker не найден — раздел Docker пропущен."
 fi
@@ -343,6 +526,7 @@ dump_cmd system/packages-rpm.txt    rpm -qa
 {
   echo "Backup manifest"
   echo "==============="
+  echo "script_version: $SCRIPT_VERSION"
   echo "host        : $(hostname -f 2>/dev/null || hostname)"
   echo "ip          : $IP_TAG"
   echo "date        : $(date -Iseconds)"
@@ -350,7 +534,8 @@ dump_cmd system/packages-rpm.txt    rpm -qa
   echo "os          : $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
   echo "docker      : $(docker --version 2>/dev/null || echo 'нет')"
   echo "encrypted   : $([[ $ENCRYPT -eq 1 ]] && echo yes || echo no)"
-  echo "volumes     : $([[ $DUMP_VOLUMES -eq 1 ]] && echo dumped || echo no)"
+  echo "volumes     : $DUMP_VOLUMES"
+  echo "cold_docker : $COLD_DOCKER"
   echo
   echo "Содержимое:"
   ( cd "$STAGE" && find . -maxdepth 3 -type d | sort )

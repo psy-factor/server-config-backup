@@ -1,173 +1,154 @@
-# Server Config Backup &amp; Restore
+# Server Config Backup & Restore
 
-**Русский** · [English](#english)
+**Версия 1.4** · [English](#english)
 
-Набор из двух bash-скриптов для снятия полной резервной копии конфигурации Linux-сервера
-и последующего её развёртывания на **чистом сервере** одной командой.
+Два Bash-скрипта для резервного копирования конфигурации и данных Linux-сервера
+и переноса служб на чистую систему. Поддерживаются Docker Compose, Remnawave
+Panel и Node, Bedolaga Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr,
+nginx, Let's Encrypt, acme.sh и UFW.
 
-Заточены под типовой VPN/прокси-стек: **3x-ui (VLESS)**, **Remnawave (panel/node)**,
-**telemt**, **mtproto.zig (mtbuddy)**, **MTPROTO_FIX_By_MEKO (mekopr)**, **nginx**,
-**Let's Encrypt / acme.sh**, **Docker / docker-compose**, **PostgreSQL**, **UFW/iptables**.
+## Что нового в 1.4
 
-> ⚠️ Скрипты собирают чувствительные данные (приватные ключи, сертификаты, `.env`, дампы БД).
-> Храните архивы в защищённом месте, а для передачи используйте шифрование (`-e` + `BACKUP_PASSPHRASE`).
-
-## Состав
+- **Bedolaga Bot.** Бэкап находит проект по метаданным Docker. Сохраняет каталог
+  проекта с `.env` и загрузками, исходное имя Compose-проекта, порядок файлов
+  `-f` и пути `--env-file`. Тома PostgreSQL и Redis входят в обычный бэкап.
+- **Cloudflare Tunnel.** Поддерживаются Compose и отдельный `cloudflared`,
+  запущенный через `docker run`. Сохраняются параметры запуска, токен из команды
+  или окружения, файлы из bind mounts и данные томов. На новом сервере заранее
+  создайте внешние Docker-сети, от которых зависит туннель.
+- **Порядок восстановления.** Docker-тома заполняются до запуска контейнеров.
+  Для Bedolaga SQL-дамп служит отдельным способом восстановления PostgreSQL,
+  если в архиве также есть том с данными.
 
 | Файл | Назначение |
 |------|------------|
-| [`BackUp-Script/server-backup.sh`](BackUp-Script/server-backup.sh) | Снимает бэкап в один `tar.gz` (+ опционально GPG) |
-| [`BackUp-Script/server-restore.sh`](BackUp-Script/server-restore.sh) | Разворачивает сервер из архива (для чистой ОС) |
+| [server-backup.sh](BackUp-Script/server-backup.sh) | Создаёт архив `tar.gz` с `MANIFEST.txt` и опциональным шифрованием GPG |
+| [server-restore.sh](BackUp-Script/server-restore.sh) | Восстанавливает выбранные компоненты из архива |
 
-Текущая версия обоих скриптов — **1.3**.
+Архив содержит приватные ключи, `.env`, токены и дампы БД. Для шифрования
+используйте `-e` вместе с экспортированной переменной `BACKUP_PASSPHRASE`.
 
-## Скачать (wget)
-
-Оба скрипта одной командой:
+## Скачать
 
 ```bash
-wget -O server-backup.sh  "https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-backup.sh" && \
-wget -O server-restore.sh "https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-restore.sh" && \
+wget -O server-backup.sh 'https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-backup.sh' &&
+wget -O server-restore.sh 'https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-restore.sh' &&
 chmod +x server-backup.sh server-restore.sh
 ```
 
-## Возможности
+Для копии из репозитория перейдите в `BackUp-Script`. Для запуска нужны Linux с
+Bash 5, стандартные GNU-утилиты, `rsync` и `python3` для метаданных Docker.
+Для контейнеров нужны Docker Engine и плагин Compose v2. Для шифрования нужен
+`gpg`. Применение настроек и копирование системных файлов выполняются через
+`sudo`.
 
-- **Один архив** со всем нужным + `MANIFEST.txt` с метаданными хоста.
-- **Логические дампы PostgreSQL** (`pg_dumpall`) из docker-контейнеров — переносимее, чем копия volume.
-- **Целостный дамп `x-ui.db`** (порт панели, креды, инбаунды, пути к сертам) + сами TLS-файлы,
-  на которые ссылается панель, даже если они лежат вне `/etc/letsencrypt`.
-- **acme.sh / Let's Encrypt / `/root/cert`** — переносятся вместе с автопродлением.
-- **MTProto-прокси — telemt, mtproto.zig (mtbuddy) и mekopr** — переносятся бинарь, рабочий каталог,
-  юниты и таймеры; при восстановлении **чинятся права** рабочих/конфиг-каталогов (частая причина
-  краша службы). Установщик запускается только как фолбэк, если бинаря нет ни в системе, ни в бэкапе.
-- **Интерактивный чеклист** при восстановлении — отмечаешь галочками, что именно накатывать.
-- **Безопасность прода**: dry-run, откат заменяемых файлов, гарантированное открытие SSH-порта
-  в UFW перед его включением, отказ от авто-применения сырых iptables (конфликт с Docker).
-
-## Требования
-
-- Bash 4+ (`declare -A`), GNU-утилиты (`grep -P`) — обычный Linux (Debian/Ubuntu, RHEL/Alma).
-- Запуск от `root` / через `sudo`.
-- Для восстановления недостающие пакеты (`rsync`, `curl`, `wget`, docker, nginx, sqlite3, ufw)
-  ставятся автоматически.
-
-## Резервное копирование
+## Бэкап
 
 ```bash
-sudo ./server-backup.sh                 # архив в подпапку ./Backups
-sudo ./server-backup.sh -o /mnt/backup  # другой каталог назначения
-sudo BACKUP_PASSPHRASE='секрет' \
-     ./server-backup.sh -e              # + шифрование GPG (AES256)
-sudo ./server-backup.sh --volumes       # + дамп docker volume'ов (тяжело!)
+sudo bash ./server-backup.sh
+sudo bash ./server-backup.sh --cold-docker -o /mnt/backup
 ```
 
-## Восстановление (на чистом сервере)
+По умолчанию архив появляется в каталоге `Backups` рядом со скриптом.
+`--cold-docker` останавливает работающие контейнеры на время копирования,
+запускает их снова и пропускает `pg_dumpall`. При обычном бэкапе скрипт
+пытается снять логический дамп работающих PostgreSQL-контейнеров. Для
+согласованной файловой копии PostgreSQL используйте `--cold-docker`.
+
+| Ключ | Действие |
+|------|----------|
+| `--volumes` | Включить все Docker-тома. По умолчанию снимаются тома найденных Bedolaga Bot и Cloudflare Tunnel |
+| `--no-volumes` | Пропустить все Docker-тома |
+| `--retention 0` | Отключить автоудаление. По умолчанию скрипт удаляет архивы этого IP старше 14 дней в каталоге назначения |
+
+## Восстановление на чистом сервере
 
 ```bash
-sudo ./server-restore.sh                  # выбрать архив + чеклист компонентов
-sudo ./server-restore.sh backup.tar.gz    # чеклист из конкретного архива
-sudo ./server-restore.sh backup.tar.gz --all       # накатить всё, без чеклиста
-sudo ./server-restore.sh backup.tar.gz --dry-run   # показать план, ничего не менять
-sudo ./server-restore.sh backup.tar.gz --only 3x-ui,nginx
-sudo BACKUP_PASSPHRASE='секрет' \
-     ./server-restore.sh backup.tar.gz.gpg
+bash ./server-restore.sh ./Backups/backup.tar.gz --dry-run --all
+sudo bash ./server-restore.sh ./Backups/backup.tar.gz
 ```
 
-По умолчанию restore **сразу применяет** изменения и **показывает чеклист** найденного софта
-(все пункты отмечены). Восстанавливаются только отмеченные компоненты — с их конфигами и правами.
+Замените `backup.tar.gz` на имя своего архива. Без пути скрипт предложит выбрать
+архив рядом со скриптом или в текущем каталоге, включая их подпапки `Backups`.
 
-### Компоненты
+В интерактивном запуске restore сразу работает в режиме применения и
+предлагает чеклист. `--dry-run` показывает план, `--all` пропускает чеклист,
+`--ask` добавляет подтверждения, `--no-install` отключает доустановку пакетов.
 
-`sysctl`, `nginx`, `letsencrypt` (TLS), `ssh`, `ssh-keys`, `3x-ui`, `projects` (remnawave/cabinet),
-`mtproto` (telemt / mtproto.zig / mekopr), `docker-compose`, `postgres`, `volumes`, `systemd`,
-`crontab`, `firewall`.
+- Bedolaga Bot выбирается через `docker-compose` и `volumes`. Туннель в Compose
+  выбирается так же. Для отдельного контейнера используются `cloudflared` и
+  `volumes`, если у него есть тома.
+- Если нужен только SQL при наличии тома PostgreSQL, подготовьте пустую БД с
+  исходным именем контейнера и запустите restore с `--only postgres`.
+- Остальные компоненты можно выбрать через `--only` со списком через запятую,
+  например `--only 3x-ui,nginx`.
 
-> После восстановления **обязательно откройте вторую SSH-сессию** и проверьте доступ,
-> прежде чем закрывать текущую.
-
----
+Restore сохраняет копии заменяемых файлов в `/root/server-restore-pre-*`.
+Если перенесены настройки SSH, проверьте доступ во второй сессии перед
+закрытием первой.
 
 ## English
 
-Two bash scripts to make a full backup of a Linux server configuration and redeploy it on a
-**fresh server** with a single command.
+**Version 1.4** provides Bash scripts to back up Linux server configuration
+and application data and restore selected services on a fresh system.
+Supported services include Docker Compose, Remnawave Panel and Node, Bedolaga
+Bot, Cloudflare Tunnel, 3x-ui, telemt, mtproto.zig, mekopr, nginx, Let's
+Encrypt, acme.sh and UFW.
 
-Built for a typical VPN/proxy stack: **3x-ui (VLESS)**, **Remnawave (panel/node)**,
-**telemt**, **mtproto.zig (mtbuddy)**, **MTPROTO_FIX_By_MEKO (mekopr)**, **nginx**,
-**Let's Encrypt / acme.sh**, **Docker / docker-compose**, **PostgreSQL**, **UFW/iptables**.
+### What's new
 
-> ⚠️ These scripts collect sensitive data (private keys, certificates, `.env`, DB dumps).
-> Store archives securely and encrypt them for transfer (`-e` + `BACKUP_PASSPHRASE`).
-
-### Files
+- **Bedolaga Bot.** The backup locates the project from Docker metadata and
+  includes its directory, `.env`, uploads and PostgreSQL and Redis volumes.
+  Restore reuses the original Compose project name, ordered `-f` files and
+  `--env-file` paths.
+- **Cloudflare Tunnel.** Both Compose and standalone `cloudflared` containers
+  are supported, including startup settings, token arguments or environment
+  variables, bind-mounted files and volume data. Create any required
+  external Docker networks on the destination before restoring.
+- **Restore order.** Volume data is restored before containers start. When the
+  Bedolaga PostgreSQL volume is present, its SQL dump remains available for
+  separate recovery.
 
 | File | Purpose |
 |------|---------|
-| [`BackUp-Script/server-backup.sh`](BackUp-Script/server-backup.sh) | Makes a single `tar.gz` backup (optionally GPG-encrypted) |
-| [`BackUp-Script/server-restore.sh`](BackUp-Script/server-restore.sh) | Restores a server from the archive (fresh OS) |
+| [server-backup.sh](BackUp-Script/server-backup.sh) | Creates a `tar.gz` archive with `MANIFEST.txt` and optional GPG encryption |
+| [server-restore.sh](BackUp-Script/server-restore.sh) | Restores selected components from the archive |
 
-Both scripts are currently at version **1.3**. Comments inside are in Russian.
+Archives contain private keys, `.env` files, tokens and database dumps.
+To encrypt a backup, export `BACKUP_PASSPHRASE` and pass `-e`.
 
-### Download (wget)
+### Quick start
 
-Both scripts in one command:
-
-```bash
-wget -O server-backup.sh  "https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-backup.sh" && \
-wget -O server-restore.sh "https://raw.githubusercontent.com/psy-factor/server-config-backup/main/BackUp-Script/server-restore.sh" && \
-chmod +x server-backup.sh server-restore.sh
-```
-
-### Features
-
-- **Single archive** with everything needed + `MANIFEST.txt` host metadata.
-- **Logical PostgreSQL dumps** (`pg_dumpall`) from docker containers — more portable than volume copies.
-- **Consistent `x-ui.db` dump** (panel port, creds, inbounds, cert paths) plus the actual TLS files
-  the panel references, even outside `/etc/letsencrypt`.
-- **acme.sh / Let's Encrypt / `/root/cert`** carried over together with auto-renewal.
-- **MTProto proxies — telemt, mtproto.zig (mtbuddy) and mekopr** — binary, working dir, units and
-  timers are backed up; on restore the ownership of working/config dirs is **fixed** (a common cause
-  of the service crashing). The installer runs only as a fallback when the binary is in neither the
-  system nor the backup.
-- **Interactive checklist** on restore — tick exactly which components to apply.
-- **Production safety**: dry-run mode, rollback copies of replaced files, SSH port force-opened in
-  UFW before enabling it, no automatic apply of raw iptables (conflicts with Docker).
-
-### Requirements
-
-- Bash 4+ (`declare -A`), GNU tools (`grep -P`) — a regular Linux (Debian/Ubuntu, RHEL/Alma).
-- Run as `root` / via `sudo`.
-- On restore, missing packages (`rsync`, `curl`, `wget`, docker, nginx, sqlite3, ufw) are installed
-  automatically.
-
-### Backup
+Download both scripts using the commands above or work from `BackUp-Script`
+in a checkout. Use Linux with Bash 5, GNU tools, `rsync` and `python3` for Docker
+metadata. Container operations require Docker Engine and Compose v2.
+Encryption requires `gpg`.
 
 ```bash
-sudo ./server-backup.sh                 # archive into ./Backups
-sudo ./server-backup.sh -o /mnt/backup  # custom destination
-sudo BACKUP_PASSPHRASE='secret' \
-     ./server-backup.sh -e              # + GPG encryption (AES256)
-sudo ./server-backup.sh --volumes       # + dump docker volumes (heavy!)
+sudo bash ./server-backup.sh --cold-docker
+bash ./server-restore.sh ./Backups/backup.tar.gz --dry-run --all
+sudo bash ./server-restore.sh ./Backups/backup.tar.gz
 ```
 
-### Restore (on a fresh server)
+Replace `backup.tar.gz` with the actual archive name. Backups go into
+`Backups` next to the script by default. Use `-o` to change the destination.
+`--cold-docker` stops and restarts the running containers and skips live SQL
+dumps. A regular run attempts `pg_dumpall` against running PostgreSQL
+containers. Use a cold run for a consistent file-level PostgreSQL copy.
 
-```bash
-sudo ./server-restore.sh                  # pick archive + component checklist
-sudo ./server-restore.sh backup.tar.gz    # checklist from a specific archive
-sudo ./server-restore.sh backup.tar.gz --all       # apply everything, no checklist
-sudo ./server-restore.sh backup.tar.gz --dry-run   # print the plan, change nothing
-sudo ./server-restore.sh backup.tar.gz --only 3x-ui,nginx
-sudo BACKUP_PASSPHRASE='secret' \
-     ./server-restore.sh backup.tar.gz.gpg
-```
+`--volumes` adds all Docker volumes. The default includes the volumes attached
+to detected Bedolaga Bot and Cloudflare Tunnel containers. `--no-volumes`
+skips all volumes. By default the script deletes archives for the current IP
+older than 14 days in the destination. Use `--retention 0` to disable cleanup.
 
-By default restore **applies immediately** and **shows a checklist** of detected software (all ticked).
-Only the ticked components are restored — with their configs and permissions.
+The second command previews the plan. The third applies it and offers the
+component checklist in an interactive terminal. To select components on the
+CLI, use `--only` with a comma-separated list. Select `docker-compose` and
+`volumes` for Bedolaga Bot and Compose-based tunnels. Standalone tunnels use
+`cloudflared` and `volumes` if applicable. To import SQL separately, prepare
+an empty PostgreSQL cluster with the original container name and select
+`--only postgres`.
 
-> After a restore, **always open a second SSH session** and verify access before closing the current one.
-
----
-
-_Generated with the help of Claude Code._
+Existing files are copied to `/root/server-restore-pre-*` before replacement.
+If SSH settings changed, verify access in a second session before closing
+the first one.
